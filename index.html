@@ -696,6 +696,12 @@ a.o-card:hover{filter:brightness(.98)}
   .todo li.ticked::before { background: var(--accent); border-color: var(--accent); }
   .todo a { font-weight: 400; }
   .todobox[open] > .more { border-bottom: 1px solid var(--stone); }
+  .obtodo li.busy { opacity: .55; }
+  .obdue { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-left: 6px; }
+  .obadd { display: flex; gap: 8px; padding: 8px 16px 4px; border-top: 1px solid var(--stone); }
+  .obadd input { flex: 1; min-width: 0; font: inherit; font-size: 15px; padding: 8px 10px; border: 1px solid var(--stone); border-radius: 8px; background: var(--paper, #fff); color: var(--ink); }
+  .obadd button { font: inherit; font-size: 14px; padding: 8px 14px; border: 0; border-radius: 8px; background: var(--ink); color: var(--paper, #fff); cursor: pointer; }
+  .obnote { margin: 4px 16px 12px; font-size: 12px; color: var(--ink-3); }
   .foot button { color: var(--accent-deep); font-weight: 400; font-size: var(--t-sm); min-height: 44px; }
   nav.tabs { background: var(--ground); -webkit-backdrop-filter: none; backdrop-filter: none; border-top: 0; box-shadow: 0 -1px 0 var(--stone); }
   nav.tabs button { font-size: var(--t-xs); font-weight: 400; color: var(--ink-2); min-height: 52px; }
@@ -717,7 +723,7 @@ a.o-card:hover{filter:brightness(.98)}
    (a first run that found nothing, or a key cleared later), so the app never stays locked
    while the catalog has the key. 'ob.keyStop' (set by the app's Lock button) stops that. */
 (function () {
-  var FLAG = 'ob.handover.v1', FROM = 'https://openbrain.thewishingstream.com', KEY = "";
+  var FLAG = 'ob.handover.v1', FROM = 'https://openbrain.thewishingstream.com', KEY = "openbrain.accessKey";
   try {
     if (localStorage.getItem(FLAG) && !(KEY && !localStorage.getItem(KEY) && !localStorage.getItem('ob.keyStop'))) return;
   } catch (e) { return; }
@@ -861,6 +867,15 @@ a.o-card:hover{filter:brightness(.98)}
   const LS_TRIP = "trips.current";
   const LS_HINT = "trips.hintDismissed";
   const LS_TODO_OPEN = "trips.todoOpen";
+  // Open Brain tasks for this trip (5 Nov 2026, Stewart: "actions on the trip app
+  // could actually be fed by the tasks for that trip in open brain"). Only where
+  // this browser holds the Open Brain key, which reaches here from the catalog
+  // through the handover (publish-apps.py), so only on Stewart's own devices.
+  // Family and friends opening the trip see the list in the trip file as before.
+  // A task belongs to a trip when its project is the trip's name (or its id).
+  const OB_KEY = "openbrain.accessKey";
+  const MCP_URL = "https://uftlxeahciewiitclkbu.supabase.co/functions/v1/open-brain-mcp";
+  let obTasks = null;        // null: not asked; { tripId, list } or { tripId, error }
   // Ticks live on this device only, keyed by the item's text so a rebuilt
   // trip keeps them unless the wording changes.
   const ticks = () => { try { return new Set(JSON.parse(store.get("trips.ticks." + trip.id) || "[]")); } catch (_) { return new Set(); } };
@@ -1074,17 +1089,77 @@ a.o-card:hover{filter:brightness(.98)}
   document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("viewer").hidden) closeViewer(); });
 
   // ---------- views ----------
+  // ---------- Open Brain tasks for this trip ----------
+  function obKey() { return store.get(OB_KEY) || ""; }
+  const projectOf = () => trip.name;
+  const isTripTask = (x) => {
+    const p = String(x.project || "").trim().toLowerCase();
+    return !!p && (p === String(trip.name || "").trim().toLowerCase() || p === String(trip.id || "").trim().toLowerCase());
+  };
+
+  function obHtml(ob) {
+    if (!ob) return "";
+    if (ob.error) return '<p class="obnote">Open Brain tasks could not be read: ' + esc(ob.error) + "</p>";
+    const open = ob.list.filter(x => x.status !== "done"), done = ob.list.filter(x => x.status === "done").slice(0, 10);
+    return '<ul class="todo obtodo">' + open.concat(done).map(x =>
+      '<li class="' + (x.status === "done" ? "ticked" : "") + '" data-obtask="' + esc(x.id) + '" data-status="' + esc(x.status) + '"><span>' + esc(x.title) +
+      (x.due_date && x.status !== "done" ? ' <span class="obdue">' + esc(fmt(x.due_date)) + "</span>" : "") + "</span></li>").join("") + "</ul>" +
+      '<form class="obadd"><input name="t" maxlength="200" placeholder="Add a task for this trip" aria-label="Add a task for this trip" enterkeyhint="done"><button type="submit">Add</button></form>' +
+      '<p class="obnote">From Open Brain: tasks with the project “' + esc(projectOf()) + "”. Only shown on your own devices.</p>";
+  }
+
+  async function obCall(name, args) {
+    const res = await fetch(MCP_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "x-brain-key": obKey() },
+      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method: "tools/call", params: { name, arguments: args } }),
+    });
+    const raw = await res.text();
+    let payload = {};
+    try {
+      if ((res.headers.get("Content-Type") || "").includes("text/event-stream")) {
+        const line = raw.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).reverse().find(l => l.startsWith("{"));
+        payload = line ? JSON.parse(line) : {};
+      } else payload = raw.trim() ? JSON.parse(raw) : {};
+    } catch (_) { throw new Error("an unreadable answer (HTTP " + res.status + ")"); }
+    // An invalid key comes back as HTTP 200 with a JSON-RPC error.
+    if (!res.ok || payload.error) throw new Error((payload.error && payload.error.message) || "HTTP " + res.status);
+    const block = ((payload.result || {}).content || []).find(b => b.type === "text");
+    if ((payload.result || {}).isError) throw new Error(block ? block.text : "refused");
+    return block ? block.text : "";
+  }
+
+  async function loadObTasks() {
+    if (!obKey() || !trip || !navigator.onLine) return;
+    const tripId = trip.id;
+    try {
+      const raw = JSON.parse(await obCall("list_tasks", { format: "json", limit: 200, include_deferred: true, status: ["inbox", "next", "waiting", "done"] }));
+      if (!trip || trip.id !== tripId) return;
+      const list = (Array.isArray(raw) ? raw : []).filter(isTripTask)
+        .map(x => ({ id: x.id, title: x.title, status: x.status, due_date: x.due_date || null, completed_at: x.completed_at || "" }))
+        .sort((a, b) => (a.status === "done") - (b.status === "done") || String(a.due_date || "9").localeCompare(String(b.due_date || "9")) || String(b.completed_at).localeCompare(String(a.completed_at)));
+      obTasks = { tripId, list };
+    } catch (err) {
+      if (!trip || trip.id !== tripId) return;
+      obTasks = { tripId, error: err.message };
+    }
+    renderDays();
+    fillPasses();
+  }
+
   function renderDays() {
     const t = todayIso();
     const stays = Object.fromEntries(trip.stays.map(s => [s.id, s]));
     let h = "";
-    if (trip.todo && trip.todo.length) {
+    const ob = obTasks && obTasks.tripId === trip.id ? obTasks : null;
+    const obOpen = ob && ob.list ? ob.list.filter(x => x.status !== "done").length : 0;
+    if ((trip.todo && trip.todo.length) || ob) {
       const ticked = ticks();
-      const left = trip.todo.filter(x => !ticked.has(x.text)).length;
+      const left = (trip.todo || []).filter(x => !ticked.has(x.text)).length + obOpen;
       h += '<details class="card todobox"' + (store.get(LS_TODO_OPEN) === "1" ? " open" : "") + '><summary class="more"><span>Still to sort <span class="pill ' + (left ? "p-pending" : "p-booked") + '">' + (left ? left + " left" : "All done") + "</span></span></summary>" +
         '<ul class="todo">' +
-        trip.todo.map(x => '<li class="' + (ticked.has(x.text) ? "ticked" : "") + '" data-tick="' + esc(x.text) + '"><span>' + esc(x.text) + (x.link ? '<br><a href="' + esc(x.link) + '"' + (x.link.startsWith("http") ? ' target="_blank" rel="noopener"' : "") + ">Open</a>" : "") + "</span></li>").join("") +
-        "</ul></details>";
+        (trip.todo || []).map(x => '<li class="' + (ticked.has(x.text) ? "ticked" : "") + '" data-tick="' + esc(x.text) + '"><span>' + esc(x.text) + (x.link ? '<br><a href="' + esc(x.link) + '"' + (x.link.startsWith("http") ? ' target="_blank" rel="noopener"' : "") + ">Open</a>" : "") + "</span></li>").join("") +
+        "</ul>" + obHtml(ob) + "</details>";
     }
     // Closed by default on every open: the front screen stays about the days.
     h += '<details class="card todobox" id="allPasses" hidden><summary class="more"><span>Your passes <span class="pill p-info" id="passCount"></span></span></summary><div class="passgrid"></div></details>';
@@ -1237,6 +1312,18 @@ a.o-card:hover{filter:brightness(.98)}
   let toastT;
   const toast = (msg) => { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("on"), 1600); };
 
+  // Adding a task to this trip in Open Brain (owner only; see loadObTasks).
+  document.addEventListener("submit", (e) => {
+    const f = e.target.closest(".obadd");
+    if (!f) return;
+    e.preventDefault();
+    const input = f.querySelector("input"), title = input.value.trim();
+    if (!title) return;
+    input.disabled = true;
+    obCall("create_task", { title, project: projectOf(), status: "next", source: "trips" })
+      .then(() => { toast("Added to Open Brain"); return loadObTasks(); },
+            (err) => { input.disabled = false; toast("Could not add it: " + err.message); });
+  });
   document.addEventListener("click", (e) => {
     const g = e.target.closest("[data-go]");
     if (g) { e.preventDefault(); go(g.dataset.go); return; }
@@ -1244,6 +1331,16 @@ a.o-card:hover{filter:brightness(.98)}
     if (c) {
       const v = c.dataset.copy;
       (navigator.clipboard ? navigator.clipboard.writeText(v) : Promise.reject()).then(() => toast("Copied " + v), () => toast(v));
+      return;
+    }
+    const ot = e.target.closest("[data-obtask]");
+    if (ot) {
+      if (ot.classList.contains("busy")) return;
+      const reopen = ot.dataset.status === "done";
+      ot.classList.add("busy");
+      ot.classList.toggle("ticked", !reopen);
+      (reopen ? obCall("update_task", { id: ot.dataset.obtask, status: "next" }) : obCall("complete_task", { id: ot.dataset.obtask }))
+        .then(() => loadObTasks(), (err) => { ot.classList.remove("busy"); ot.classList.toggle("ticked", reopen); toast("Could not change that: " + err.message); });
       return;
     }
     const tk = e.target.closest("[data-tick]");
@@ -1312,10 +1409,11 @@ a.o-card:hover{filter:brightness(.98)}
     if (all.length > 1) {
       sel.hidden = false;
       sel.innerHTML = all.map(x => '<option value="' + esc(x.id) + '"' + (x === trip ? " selected" : "") + ">" + esc(x.name) + " · " + esc(fmt(x.start)) + "</option>").join("");
-      sel.addEventListener("change", () => { trip = all.find(x => x.id === sel.value); store.set(LS_TRIP, trip.id); renderAll(); loadPasses(); });
+      sel.addEventListener("change", () => { trip = all.find(x => x.id === sel.value); store.set(LS_TRIP, trip.id); renderAll(); loadPasses(); loadObTasks(); });
     }
     renderAll();
     loadPasses();
+    loadObTasks();
     const tab = store.get(LS_TAB);
     showTab(["days", "travel", "stays", "places"].includes(tab) ? tab : "days");
     const today = $("day-" + todayIso());
